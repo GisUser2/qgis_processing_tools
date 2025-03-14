@@ -1,6 +1,6 @@
 # --------------------------------------------------
 # Author: GisUser2
-# Version: 0.1
+# Version: 0.1.2
 # Created with: QGIS 3.40.3
 # Mar 2025
 # --------------------------------------------------
@@ -22,10 +22,9 @@ from qgis.core import (
 )
 from qgis.PyQt.QtCore import QCoreApplication
 import numpy as np
-from skimage.feature import peak_local_max
-import rasterio
-from rasterio.transform import from_origin
 import importlib.util
+import subprocess
+import sys
 
 class LocalMaximaDetection(QgsProcessingAlgorithm):
     """
@@ -55,21 +54,41 @@ class LocalMaximaDetection(QgsProcessingAlgorithm):
         """Required factory method to create new algorithm instances"""
         return LocalMaximaDetection()
 
-    def checkDependencies(self):
+    def checkDependencies(self, feedback):
         """
-        Verifies required Python packages are installed.
+        Verifies and installs required Python packages.
         
         Raises:
-            QgsProcessingException: If any required package is missing
+            QgsProcessingException: If installation fails
         """
-        required = {'rasterio', 'skimage'}
-        missing = [pkg for pkg in required if not importlib.util.find_spec(pkg)]
-        
-        if missing:
-            raise QgsProcessingException(
-                self.tr("Missing dependencies. Install with: ") + 
-                f"pip install {' '.join(missing)}"
-            )
+        required = {'rasterio': 'rasterio', 'skimage': 'scikit-image'}
+        to_install = []
+
+        # Check for missing packages
+        for module, package in required.items():
+            if not importlib.util.find_spec(module):
+                to_install.append(package)
+
+        # Install missing packages
+        if to_install:
+            feedback.pushInfo(self.tr(f"Installing required packages: {', '.join(to_install)}"))
+            try:
+                subprocess.check_call(
+                    [sys.executable, '-m', 'pip', 'install', *to_install],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT
+                )
+            except subprocess.CalledProcessError as e:
+                raise QgsProcessingException(
+                    self.tr("Package installation failed. Error code: ") + str(e.returncode)
+                )
+
+            # Verify installation
+            for module in required.keys():
+                if not importlib.util.find_spec(module):
+                    raise QgsProcessingException(
+                        self.tr(f"Critical error: {module} could not be installed automatically")
+                    )
 
     def initAlgorithm(self, config=None):
         """Defines algorithm parameters and UI configuration"""
@@ -100,21 +119,16 @@ class LocalMaximaDetection(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         """
         Executes the core processing logic.
-        
-        Steps:
-            1. Validate dependencies
-            2. Read input parameters
-            3. Load raster data
-            4. Detect local maxima
-            5. Generate output raster
-        
-        Raises:
-            QgsProcessingException: On any processing error
         """
         try:
-            # Check for required libraries before processing
-            self.checkDependencies()
+            # Check and install dependencies
+            self.checkDependencies(feedback)
             
+            # Import required modules after installation
+            from skimage.feature import peak_local_max
+            import rasterio
+            from rasterio.transform import from_origin
+
             # Extract input parameters from QGIS
             input_layer = self.parameterAsRasterLayer(parameters, self.INPUT_LAYER, context)
             neighborhood_size = self.parameterAsInt(parameters, self.NEIGHBORHOOD_SIZE, context)
@@ -130,11 +144,9 @@ class LocalMaximaDetection(QgsProcessingAlgorithm):
                 raise QgsProcessingException("Invalid raster data block")
 
             # Convert QGIS raster block to NumPy array for processing
-            # Note: as_numpy() requires QGIS 3.40+
             raster_data = block.as_numpy()
 
             # Detect local maxima using scikit-image
-            # exclude_border=False allows edge detection
             coordinates = peak_local_max(
                 raster_data,
                 min_distance=neighborhood_size,
@@ -143,13 +155,12 @@ class LocalMaximaDetection(QgsProcessingAlgorithm):
 
             # Create binary output raster where maxima are 255
             local_max = np.zeros_like(raster_data, dtype=np.uint8)
-            # Transpose coordinates for proper array indexing
             local_max[tuple(coordinates.T)] = 255
 
             # Create georeferencing transform for output
             transform = from_origin(
-                input_layer.extent().xMinimum(),  # xmin
-                input_layer.extent().yMaximum(),  # ymax
+                input_layer.extent().xMinimum(),
+                input_layer.extent().yMaximum(),
                 input_layer.rasterUnitsPerPixelX(),
                 input_layer.rasterUnitsPerPixelY()
             )
@@ -166,13 +177,14 @@ class LocalMaximaDetection(QgsProcessingAlgorithm):
                 crs=input_layer.crs().toWkt(),
                 transform=transform
             ) as dst:
-                dst.write(local_max, 1)  # Write to band 1
+                dst.write(local_max, 1)
 
             return {self.OUTPUT_LAYER: output_path}
 
         except Exception as e:
             feedback.reportError(self.tr(f"Error: {str(e)}"), fatalError=True)
             raise QgsProcessingException(str(e))
+
 
     def name(self):
         """Unique algorithm identifier (lowercase with underscores)"""
